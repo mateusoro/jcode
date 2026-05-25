@@ -8,6 +8,43 @@ pub(super) fn handle_tool_done(
     output: String,
     error: Option<String>,
 ) -> bool {
+    // Check if this tool has a pending entry that already rendered the tool header.
+    // If so, use it to render the full tool result now instead of creating a duplicate.
+    if let Some(pending_tc) = app.pending_tool_entry.take() {
+        if pending_tc.id == id {
+            // Render the complete tool result using the pending entry
+            let display_output = if error.is_some()
+                && !output.starts_with("Error:")
+                && !output.starts_with("error:")
+                && !output.starts_with("Failed:")
+            {
+                format!("Error: {}", output)
+            } else {
+                output.clone()
+            };
+            let is_batch = pending_tc.name == "batch";
+            app.observe_tool_result(&pending_tc, &output, error.is_some(), None);
+            app.push_display_message(DisplayMessage {
+                role: "tool".to_string(),
+                content: display_output,
+                tool_calls: vec![],
+                duration_secs: None,
+                title: None,
+                tool_data: Some(pending_tc),
+            });
+            if is_batch {
+                app.batch_progress = None;
+            }
+            app.streaming_tool_calls.clear();
+            app.status = ProcessingStatus::Streaming;
+            return true;
+        } else {
+            // ID mismatch — put it back and fall through to normal path
+            app.pending_tool_entry = Some(pending_tc);
+        }
+    }
+
+    // Normal path: no pending entry, render tool result directly
     let display_output = remote.handle_tool_done(&id, &name, &output);
     let display_output = if error.is_some()
         && !display_output.starts_with("Error:")

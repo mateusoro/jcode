@@ -640,6 +640,10 @@ pub struct App {
     session_save_pending: bool,
     // Tool calls detected during streaming (shown in real-time with details)
     streaming_tool_calls: Vec<ToolCall>,
+    /// A tool call that has started (ToolStart received) but not yet completed (ToolDone).
+    /// When set, the tool result will be rendered by the pending-tool path instead of
+    /// the normal handle_tool_done path — preventing duplicate on-screen entries.
+    pending_tool_entry: Option<ToolCall>,
     // Provider-specific session ID for conversation resume
     provider_session_id: Option<String>,
     // One-step undo snapshot captured before the most recent local rewind.

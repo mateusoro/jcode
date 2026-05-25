@@ -85,12 +85,17 @@ pub(in crate::tui::app) fn handle_server_event(
                 crate::memory::set_state(crate::tui::info_widget::MemoryState::Embedding);
             }
             app.status = ProcessingStatus::RunningTool(name.clone());
-            app.streaming_tool_calls.push(ToolCall {
-                id,
-                name,
+            // Store in pending_tool_entry — will be rendered when ToolDone arrives.
+            // This prevents the tool from appearing on-screen before its result is ready.
+            let tc = ToolCall {
+                id: id.clone(),
+                name: name.clone(),
                 input: serde_json::Value::Null,
                 intent: None,
-            });
+            };
+            app.pending_tool_entry = Some(tc.clone());
+            app.streaming_tool_calls.clear();
+            app.streaming_tool_calls.push(tc);
             eager_stream_redraw
         }
         ServerEvent::ToolInput { delta } => {
@@ -110,8 +115,15 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.note_experimental_feature_use(key);
             }
             if let Some(tc) = app.streaming_tool_calls.iter_mut().find(|tc| tc.id == id) {
-                tc.input = parsed_input;
+                tc.input = parsed_input.clone();
                 tc.refresh_intent_from_input();
+                // Also update pending_tool_entry so it has the full input when rendered
+                if let Some(ref mut pending) = app.pending_tool_entry {
+                    if pending.id == *id {
+                        pending.input = parsed_input.clone();
+                        pending.intent = tc.intent.clone();
+                    }
+                }
             }
             remote.handle_tool_exec(&id, &name);
             app.observe_tool_call(&tool_call);
