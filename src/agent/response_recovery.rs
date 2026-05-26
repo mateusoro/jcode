@@ -4,6 +4,15 @@ impl Agent {
     fn parse_text_wrapped_tool_call(
         text: &str,
     ) -> Option<(String, String, serde_json::Value, String)> {
+        // Try Claude format first: "to=functions.<tool_name>"
+        if let Some(result) = Self::parse_claude_format(text) {
+            return Some(result);
+        }
+        // Try Minimax format: "minimax:tool_call(<tool_name>, {json})"
+        Self::parse_minimax_format(text)
+    }
+
+    fn parse_claude_format(text: &str) -> Option<(String, String, serde_json::Value, String)> {
         let marker = "to=functions.";
         let marker_idx = text.find(marker)?;
         let after_marker = &text[marker_idx + marker.len()..];
@@ -22,6 +31,59 @@ impl Agent {
 
         let tool_name = after_marker[..tool_name_end].to_string();
         let remaining = &after_marker[tool_name_end..];
+        Self::parse_json_arguments(&tool_name, text, marker_idx, remaining)
+    }
+
+    fn parse_minimax_format(text: &str) -> Option<(String, String, serde_json::Value, String)> {
+        // Format: "minimax:tool_call(<tool_name>, {json...})"
+        let marker = "minimax:tool_call(";
+        let marker_idx = text.find(marker)?;
+        let after_marker = &text[marker_idx + marker.len()..];
+
+        // Extract tool name (until first comma)
+        let comma_idx = after_marker.find(',')?;
+        let tool_name = after_marker[..comma_idx].trim().to_string();
+
+        // Extract JSON arguments (everything after the comma until closing paren)
+        let args_start = comma_idx + 1;
+        let args_text = &after_marker[args_start..];
+
+        // Find matching closing paren for the outer tool_call(
+        let mut paren_depth = 1;
+        let mut json_end = 0;
+        for (idx, ch) in args_text.char_indices() {
+            match ch {
+                '(' | '{' | '[' => paren_depth += 1,
+                ')' | '}' | ']' => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        json_end = idx;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if json_end == 0 {
+            return None;
+        }
+
+        let json_str = args_text[..json_end].trim();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+        let prefix = text[..marker_idx].trim_end().to_string();
+        let suffix = args_text[json_end + 1..].trim().to_string();
+
+        Some((prefix, tool_name, parsed, suffix))
+    }
+
+    fn parse_json_arguments(
+        tool_name: &str,
+        text: &str,
+        marker_idx: usize,
+        remaining: &str,
+    ) -> Option<(String, String, serde_json::Value, String)> {
         let mut fallback: Option<(String, String, serde_json::Value, String)> = None;
 
         for (brace_idx, ch) in remaining.char_indices() {
@@ -43,10 +105,10 @@ impl Agent {
             let prefix = text[..marker_idx].trim_end().to_string();
             let suffix = remaining[brace_idx + consumed..].trim().to_string();
             if suffix.is_empty() {
-                return Some((prefix, tool_name.clone(), parsed, suffix));
+                return Some((prefix, tool_name.to_string(), parsed, suffix));
             }
             if fallback.is_none() {
-                fallback = Some((prefix, tool_name.clone(), parsed, suffix));
+                fallback = Some((prefix, tool_name.to_string(), parsed, suffix));
             }
         }
 
