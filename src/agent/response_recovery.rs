@@ -8,7 +8,12 @@ impl Agent {
         if let Some(result) = Self::parse_claude_format(text) {
             return Some(result);
         }
-        // Try Minimax format: "minimax:tool_call(<tool_name>, {json})"
+        // Try MiniMax XML-like format:
+        // <minimax:tool_call><invoke name="bash"><parameter ...>...</parameter></invoke></minimax:tool_call>
+        if let Some(result) = Self::parse_minimax_xml_format(text) {
+            return Some(result);
+        }
+        // Try MiniMax function format: "minimax:tool_call(<tool_name>, {json})"
         Self::parse_minimax_format(text)
     }
 
@@ -76,6 +81,85 @@ impl Agent {
         let suffix = args_text[json_end + 1..].trim().to_string();
 
         Some((prefix, tool_name, parsed, suffix))
+    }
+
+    fn parse_minimax_xml_format(text: &str) -> Option<(String, String, serde_json::Value, String)> {
+        let start_marker = "<minimax:tool_call>";
+        let end_marker = "</minimax:tool_call>";
+        let marker_idx = text.find(start_marker)?;
+        let after_start_idx = marker_idx + start_marker.len();
+        let after_start = &text[after_start_idx..];
+        let relative_end_idx = after_start.find(end_marker)?;
+        let inner = &after_start[..relative_end_idx];
+        let suffix = after_start[relative_end_idx + end_marker.len()..]
+            .trim()
+            .to_string();
+
+        let invoke_marker = "<invoke";
+        let invoke_idx = inner.find(invoke_marker)?;
+        let invoke_after = &inner[invoke_idx + invoke_marker.len()..];
+        let invoke_tag_end = invoke_after.find('>')?;
+        let invoke_attrs = &invoke_after[..invoke_tag_end];
+        let tool_name = Self::extract_xml_attr(invoke_attrs, "name")?;
+        if tool_name.trim().is_empty() {
+            return None;
+        }
+
+        let invoke_body = &invoke_after[invoke_tag_end + 1..];
+        let invoke_body = invoke_body.split("</invoke>").next().unwrap_or(invoke_body);
+
+        let mut args = serde_json::Map::new();
+        let mut rest = invoke_body;
+        let parameter_marker = "<parameter";
+        while let Some(param_idx) = rest.find(parameter_marker) {
+            let after_param = &rest[param_idx + parameter_marker.len()..];
+            let Some(param_tag_end) = after_param.find('>') else {
+                break;
+            };
+            let param_attrs = &after_param[..param_tag_end];
+            let Some(param_name) = Self::extract_xml_attr(param_attrs, "name") else {
+                rest = &after_param[param_tag_end + 1..];
+                continue;
+            };
+            let value_start = param_tag_end + 1;
+            let after_value_start = &after_param[value_start..];
+            let Some(value_end) = after_value_start.find("</parameter>") else {
+                break;
+            };
+            let raw_value = &after_value_start[..value_end];
+            let value = Self::decode_xml_entities(raw_value.trim());
+            args.insert(param_name, serde_json::Value::String(value));
+            rest = &after_value_start[value_end + "</parameter>".len()..];
+        }
+
+        if args.is_empty() {
+            return None;
+        }
+
+        let prefix = text[..marker_idx].trim_end().to_string();
+        Some((prefix, tool_name, serde_json::Value::Object(args), suffix))
+    }
+
+    fn extract_xml_attr(attrs: &str, name: &str) -> Option<String> {
+        let needle = format!("{name}=");
+        let start = attrs.find(&needle)? + needle.len();
+        let rest = attrs[start..].trim_start();
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let value = &rest[quote.len_utf8()..];
+        let end = value.find(quote)?;
+        Some(Self::decode_xml_entities(&value[..end]))
+    }
+
+    fn decode_xml_entities(value: &str) -> String {
+        value
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
     }
 
     fn parse_json_arguments(
@@ -257,5 +341,42 @@ impl Agent {
                 self.persist_session_best_effort("truncated tool-call repair");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_minimax_xml_wrapped_tool_call() {
+        let text = r#"Before
+<minimax:tool_call>
+<invoke name="bash">
+<parameter name="command">printf JCODE_TOOL_OK</parameter>
+<parameter name="timeout">120000</parameter>
+</invoke>
+</minimax:tool_call>
+After"#;
+
+        let (prefix, tool_name, arguments, suffix) =
+            Agent::parse_text_wrapped_tool_call(text).expect("MiniMax XML tool call should parse");
+
+        assert_eq!(prefix, "Before");
+        assert_eq!(tool_name, "bash");
+        assert_eq!(arguments["command"], "printf JCODE_TOOL_OK");
+        assert_eq!(arguments["timeout"], "120000");
+        assert_eq!(suffix, "After");
+    }
+
+    #[test]
+    fn parses_minimax_function_wrapped_tool_call() {
+        let text = r#"minimax:tool_call(bash, {"command":"printf JCODE_TOOL_OK"})"#;
+        let (_prefix, tool_name, arguments, suffix) = Agent::parse_text_wrapped_tool_call(text)
+            .expect("MiniMax function tool call should parse");
+
+        assert_eq!(tool_name, "bash");
+        assert_eq!(arguments["command"], "printf JCODE_TOOL_OK");
+        assert!(suffix.is_empty());
     }
 }

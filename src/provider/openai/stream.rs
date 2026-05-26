@@ -20,6 +20,13 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) fn parse_text_wrapped_tool_call(text: &str) -> Option<(String, String, String, String)> {
+    if let Some(parsed) = parse_minimax_xml_wrapped_tool_call(text) {
+        return Some(parsed);
+    }
+    if let Some(parsed) = parse_minimax_function_wrapped_tool_call(text) {
+        return Some(parsed);
+    }
+
     let marker = "to=functions.";
     let marker_idx = text.find(marker)?;
     let after_marker = &text[marker_idx + marker.len()..];
@@ -67,6 +74,120 @@ pub(super) fn parse_text_wrapped_tool_call(text: &str) -> Option<(String, String
     }
 
     fallback
+}
+
+fn parse_minimax_function_wrapped_tool_call(
+    text: &str,
+) -> Option<(String, String, String, String)> {
+    let marker = "minimax:tool_call(";
+    let marker_idx = text.find(marker)?;
+    let after_marker = &text[marker_idx + marker.len()..];
+    let comma_idx = after_marker.find(',')?;
+    let tool_name = after_marker[..comma_idx].trim().to_string();
+    if tool_name.is_empty() {
+        return None;
+    }
+
+    let args_text = &after_marker[comma_idx + 1..];
+    let mut stream = serde_json::Deserializer::from_str(args_text).into_iter::<Value>();
+    let parsed = match stream.next() {
+        Some(Ok(value)) if value.is_object() => value,
+        Some(Ok(_)) | Some(Err(_)) | None => return None,
+    };
+    let consumed = stream.byte_offset();
+    let after_json = args_text[consumed..].trim_start();
+    let suffix = after_json
+        .strip_prefix(')')
+        .unwrap_or(after_json)
+        .trim()
+        .to_string();
+    let args = serde_json::to_string(&parsed).ok()?;
+    Some((
+        text[..marker_idx].trim_end().to_string(),
+        tool_name,
+        args,
+        suffix,
+    ))
+}
+
+fn parse_minimax_xml_wrapped_tool_call(text: &str) -> Option<(String, String, String, String)> {
+    let start_marker = "<minimax:tool_call>";
+    let end_marker = "</minimax:tool_call>";
+    let marker_idx = text.find(start_marker)?;
+    let after_start_idx = marker_idx + start_marker.len();
+    let after_start = &text[after_start_idx..];
+    let relative_end_idx = after_start.find(end_marker)?;
+    let inner = &after_start[..relative_end_idx];
+    let suffix = after_start[relative_end_idx + end_marker.len()..]
+        .trim()
+        .to_string();
+
+    let invoke_marker = "<invoke";
+    let invoke_idx = inner.find(invoke_marker)?;
+    let invoke_after = &inner[invoke_idx + invoke_marker.len()..];
+    let invoke_tag_end = invoke_after.find('>')?;
+    let tool_name = extract_xml_attr(&invoke_after[..invoke_tag_end], "name")?;
+    if tool_name.trim().is_empty() {
+        return None;
+    }
+
+    let invoke_body = invoke_after[invoke_tag_end + 1..]
+        .split("</invoke>")
+        .next()
+        .unwrap_or("");
+
+    let mut args = serde_json::Map::new();
+    let mut rest = invoke_body;
+    while let Some(param_idx) = rest.find("<parameter") {
+        let after_param = &rest[param_idx + "<parameter".len()..];
+        let Some(param_tag_end) = after_param.find('>') else {
+            break;
+        };
+        let Some(param_name) = extract_xml_attr(&after_param[..param_tag_end], "name") else {
+            rest = &after_param[param_tag_end + 1..];
+            continue;
+        };
+        let after_value_start = &after_param[param_tag_end + 1..];
+        let Some(value_end) = after_value_start.find("</parameter>") else {
+            break;
+        };
+        let value = decode_xml_entities(after_value_start[..value_end].trim());
+        args.insert(param_name, Value::String(value));
+        rest = &after_value_start[value_end + "</parameter>".len()..];
+    }
+    if args.is_empty() {
+        return None;
+    }
+
+    let args = serde_json::to_string(&Value::Object(args)).ok()?;
+    Some((
+        text[..marker_idx].trim_end().to_string(),
+        tool_name,
+        args,
+        suffix,
+    ))
+}
+
+fn extract_xml_attr(attrs: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=");
+    let start = attrs.find(&needle)? + needle.len();
+    let rest = attrs[start..].trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value = &rest[quote.len_utf8()..];
+    let end = value.find(quote)?;
+    Some(decode_xml_entities(&value[..end]))
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn stream_text_or_recovered_tool_call(
@@ -772,6 +893,42 @@ mod tests {
         let text = "prefix to=functions.read [1,2,3]";
         let parsed = parse_text_wrapped_tool_call(text);
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_text_wrapped_tool_call_accepts_minimax_xml() {
+        let text = r#"prefix
+<minimax:tool_call>
+<invoke name="bash">
+<parameter name="command">printf JCODE_TOOL_OK</parameter>
+<parameter name="timeout">120000</parameter>
+</invoke>
+</minimax:tool_call>
+suffix"#;
+
+        let (prefix, name, arguments, suffix) =
+            parse_text_wrapped_tool_call(text).expect("MiniMax XML tool call should parse");
+
+        assert_eq!(prefix, "prefix");
+        assert_eq!(name, "bash");
+        assert_eq!(suffix, "suffix");
+        let args: Value = serde_json::from_str(&arguments).expect("arguments should be JSON");
+        assert_eq!(args["command"], "printf JCODE_TOOL_OK");
+        assert_eq!(args["timeout"], "120000");
+    }
+
+    #[test]
+    fn parse_text_wrapped_tool_call_accepts_minimax_function() {
+        let text = r#"prefix minimax:tool_call(bash, {"command":"printf JCODE_TOOL_OK"}) suffix"#;
+
+        let (prefix, name, arguments, suffix) =
+            parse_text_wrapped_tool_call(text).expect("MiniMax function tool call should parse");
+
+        assert_eq!(prefix, "prefix");
+        assert_eq!(name, "bash");
+        assert_eq!(suffix, "suffix");
+        let args: Value = serde_json::from_str(&arguments).expect("arguments should be JSON");
+        assert_eq!(args["command"], "printf JCODE_TOOL_OK");
     }
 
     #[test]
